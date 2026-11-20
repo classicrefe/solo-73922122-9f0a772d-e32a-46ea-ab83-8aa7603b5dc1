@@ -1,0 +1,26 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "5432:5432"
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/postgres
+      STEP_TIMEOUT_SECONDS: "10"   # a step running this long stops the round
+      MAX_PARALLEL_ROUNDS: "2"     # hard cap on rounds in flight
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
