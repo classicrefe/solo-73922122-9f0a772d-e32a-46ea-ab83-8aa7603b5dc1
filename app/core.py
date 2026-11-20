@@ -31,6 +31,9 @@ TERMINAL_STEP_STATES = frozenset({"done", "error", "canceled"})
 IDLE_TX_STATES = frozenset({"not_started", "committed", "rolled_back", "dead", "closed"})
 MAX_ROWS = 500  # per-SELECT row cap kept in the record
 
+# SQLSTATEs that mean the source schema/table disappeared under us
+_MISSING_RELATION_CODES = frozenset({"3F000", "42P01"})
+
 BASELINE_BATCHES = [(1, True), (2, False)]
 BASELINE_READINGS = [(1, 1, 10.5), (2, 1, 11.0), (3, 1, 9.8)]
 
@@ -53,6 +56,18 @@ class BusyError(Exception):
 
 class RoundStateError(Exception):
     """Raised when an operation is not allowed in the current round/tx state."""
+
+
+class SourceRoundGone(Exception):
+    """Raised when the source round is cleaned up before its snapshot was read."""
+
+
+class ForkFailed(Exception):
+    """Raised when copying the snapshot into a new round failed.
+
+    The partial schema has already been dropped before this is raised, so the
+    caller only has to report the reason; no residual data is left behind.
+    """
 
 
 class TxWorker(threading.Thread):
@@ -196,10 +211,14 @@ class TxWorker(threading.Thread):
 
 
 class Round:
-    def __init__(self, manager: "RoundManager", round_id: str, schema: str):
+    def __init__(self, manager: "RoundManager", round_id: str, schema: str,
+                 source_round_id: str | None = None,
+                 copied: dict | None = None):
         self.manager = manager
         self.id = round_id
         self.schema = schema
+        self.source_round_id = source_round_id  # None = baseline round
+        self.copied = copied  # {"batches": n, "readings": n} for forked rounds
         self.lock = threading.RLock()
         self.state = "active"  # active -> stopping -> finished
         self.reason = None     # completed | stopped | timeout | shutdown
@@ -368,6 +387,8 @@ class Round:
                 "state": self.state,
                 "reason": self.reason,
                 "schema": self.schema,
+                "source_round_id": self.source_round_id,
+                "copied": self.copied,
                 "created_at": self.created_at,
                 "finished_at": self.finished_at,
                 "detail": self.detail,
@@ -401,6 +422,9 @@ class RoundManager:
         self.max_rounds = max_rounds
         self.lock = threading.Lock()
         self.rounds: dict[str, Round] = {}
+        # rounds being created right now (schema copy in progress).  They
+        # already occupy a parallel-round slot but are not visible yet.
+        self._pending = 0
         self._halt = threading.Event()
         self._monitor = threading.Thread(
             target=self._monitor_loop, daemon=True, name="round-monitor")
@@ -409,20 +433,93 @@ class RoundManager:
         self._monitor.start()
 
     # ---------------- round lifecycle ----------------
-    def create_round(self) -> Round:
+    def _reserve_slot(self) -> None:
         with self.lock:
-            active = [r for r in self.rounds.values() if r.state != "finished"]
-            if len(active) >= self.max_rounds:
+            active = sum(1 for r in self.rounds.values() if r.state != "finished")
+            if active + self._pending >= self.max_rounds:
                 raise BusyError(
-                    f"already {len(active)} round(s) in flight; "
+                    f"already {active} round(s) in flight; "
                     f"at most {self.max_rounds} parallel rounds are allowed")
-            round_id = uuid.uuid4().hex[:8]
-            schema = f"r_{round_id}"
-        self._create_schema(schema)
-        rnd = Round(self, round_id, schema)
+            self._pending += 1
+
+    def _release_slot(self) -> None:
+        with self.lock:
+            self._pending -= 1
+
+    def _register(self, schema: str, source_round_id: str | None,
+                  copied: dict | None) -> Round:
+        round_id = schema[2:]  # schema = r_<round_id>
+        rnd = Round(self, round_id, schema, source_round_id=source_round_id,
+                    copied=copied)
         with self.lock:
             self.rounds[round_id] = rnd
+            self._pending -= 1
         return rnd
+
+    def create_round(self) -> Round:
+        """Create a round preloaded with the fixed baseline data."""
+        self._reserve_slot()
+        schema = f"r_{uuid.uuid4().hex[:8]}"
+        try:
+            self._create_schema(schema)
+        except Exception:
+            self._drop_schema_quietly(schema)  # no residue on failure
+            self._release_slot()
+            raise
+        return self._register(schema, None, None)
+
+    def fork_round(self, source_round_id: str) -> Round:
+        """Create a new round whose data is a copy of a *committed snapshot*
+        of the (still active) source round.
+
+        Both tables are read in one REPEATABLE READ transaction, so the copy
+        always reflects a single consistent committed state - never a
+        half-applied batch.  The copy happens in its own transaction; the
+        source round is not locked out and may still commit or roll back.
+        The new round is exposed only after both tables were copied
+        completely.  If the source schema disappears (cleaned up first) or
+        the copy fails, the partial schema is dropped and the reserved slot
+        is returned.
+        """
+        source = self.get_round(source_round_id)
+        if source is None:
+            raise KeyError(source_round_id)
+        with source.lock:
+            if source.state != "active":
+                raise RoundStateError(
+                    f"source round {source.id!r} is {source.state}; only an "
+                    "active round can be forked")
+        self._reserve_slot()  # 409 BusyError when both slots are taken
+
+        schema = f"r_{uuid.uuid4().hex[:8]}"
+        copied = {"batches": 0, "readings": 0}
+        try:
+            copied = self._copy_snapshot(source.schema, schema)
+        except psycopg2.Error as exc:
+            self._drop_schema_quietly(schema)
+            self._release_slot()
+            if getattr(exc, "pgcode", None) in _MISSING_RELATION_CODES \
+                    and not self._schema_exists(source.schema):
+                raise SourceRoundGone(
+                    f"source round {source.id!r} was cleaned up "
+                    f"(schema {source.schema} no longer exists) before its "
+                    "snapshot could be read; no new round was opened"
+                ) from exc
+            raise ForkFailed(
+                f"copying the snapshot of round {source.id!r} failed "
+                f"({type(exc).__name__}, pgcode={getattr(exc, 'pgcode', None)}): "
+                f"{str(exc).strip()}; partial data was removed and the slot "
+                "was released"
+            ) from exc
+        except Exception as exc:
+            self._drop_schema_quietly(schema)
+            self._release_slot()
+            raise ForkFailed(
+                f"copying the snapshot of round {source.id!r} failed "
+                f"({type(exc).__name__}): {exc}; partial data was removed and "
+                "the slot was released"
+            ) from exc
+        return self._register(schema, source.id, copied)
 
     def get_round(self, round_id: str) -> Round | None:
         with self.lock:
@@ -477,6 +574,66 @@ class RoundManager:
         try:
             with conn.cursor() as cur:
                 cur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        finally:
+            conn.close()
+
+    def _drop_schema_quietly(self, schema: str) -> None:
+        try:
+            self.drop_schema(schema)
+        except Exception:
+            pass  # best effort; the schema may never have been created
+
+    def _schema_exists(self, schema: str) -> bool:
+        try:
+            conn = self._admin_connect()
+        except Exception:
+            return True  # cannot tell; report the original copy failure instead
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM information_schema.schemata "
+                    "WHERE schema_name = %s", (schema,))
+                return cur.fetchone() is not None
+        finally:
+            conn.close()
+
+    def _copy_snapshot(self, source_schema: str, target_schema: str) -> dict:
+        """Copy ``batches`` + ``readings`` from source to target in one
+        dedicated REPEATABLE READ transaction.
+
+        Both tables are therefore read from the SAME committed snapshot, so
+        the new round never inherits a half-applied batch.  The transaction
+        also creates the target schema and tables, so a failure aborts and
+        leaves nothing behind (and the source is only ever read).
+        """
+        conn = psycopg2.connect(self.dsn)
+        try:
+            conn.autocommit = False
+            with conn.cursor() as cur:
+                # one snapshot for both SELECTs -> both tables copied from
+                # the very same committed state of the source round
+                cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                cur.execute(f'CREATE SCHEMA "{target_schema}"')
+                # same key constraints as the baseline tables
+                cur.execute(
+                    f'CREATE TABLE "{target_schema}".batches('
+                    "id INT PRIMARY KEY, ready BOOLEAN NOT NULL)")
+                cur.execute(
+                    f'CREATE TABLE "{target_schema}".readings('
+                    "id INT PRIMARY KEY, "
+                    f'batch_id INT NOT NULL REFERENCES "{target_schema}".batches(id), '
+                    "value NUMERIC NOT NULL)")
+                cur.execute(
+                    f'INSERT INTO "{target_schema}".batches(id, ready) '
+                    f'SELECT id, ready FROM "{source_schema}".batches ORDER BY id')
+                n_batches = cur.rowcount
+                cur.execute(
+                    f'INSERT INTO "{target_schema}".readings(id, batch_id, value) '
+                    f'SELECT id, batch_id, value FROM "{source_schema}".readings '
+                    "ORDER BY id")
+                n_readings = cur.rowcount
+            conn.commit()
+            return {"batches": n_batches, "readings": n_readings}
         finally:
             conn.close()
 

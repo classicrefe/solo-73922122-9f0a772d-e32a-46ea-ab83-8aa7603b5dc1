@@ -23,7 +23,8 @@ from fastapi import FastAPI, HTTPException, Path
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
-from .core import BusyError, Round, RoundManager, RoundStateError
+from .core import (BusyError, ForkFailed, Round, RoundManager, RoundStateError,
+                   SourceRoundGone)
 
 manager: RoundManager
 
@@ -44,7 +45,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Half-Batch Transaction Lab",
-    version="1.0.0",
+    version="1.1.0",
     description=__doc__,
     lifespan=lifespan,
 )
@@ -107,6 +108,52 @@ def create_round():
         raise HTTPException(409, str(exc))
     except Exception as exc:
         raise HTTPException(500, f"failed to create round: {exc}")
+    return rnd.summary()
+
+
+@app.post("/rounds/{round_id}/fork", status_code=201, tags=["rounds"],
+          summary="Open a new round copied from this round's committed snapshot",
+          responses={
+              404: {"description": "Unknown round"},
+              409: {"description": "Source not active, cleaned up first, or no "
+                                    "parallel-round slot left"},
+              500: {"description": "Copy failed; partial data removed and the "
+                                   "slot released"},
+          })
+def fork_round(round_id: str):
+    """Opens a new round whose `batches` and `readings` are copied from the
+    same committed snapshot of this (source) round.
+
+    - The snapshot is read in one `REPEATABLE READ` transaction, so both
+      tables always come from the very same committed state; the copy never
+      contains a half-applied batch.
+    - The source round stays usable: it can still commit or roll back.
+    - The new round keeps both tables' key constraints (`PRIMARY KEY`, the
+      `readings.batch_id -> batches.id` foreign key), gets its own schema and
+      transactions, and starts with an empty step record.
+    - The usual parallel-round cap applies; when both slots are taken the
+      call returns 409.
+    - The new round becomes visible only after both tables were copied
+      completely.  If the source is cleaned up first (`409`) or the copy
+      fails (`500`), the reason is reported, partial data is dropped and the
+      reserved slot is given back.
+
+    Poll `GET /rounds` afterwards; the forked round is listed with
+    `source_round_id` set and `copied` row counts.
+    """
+    get_round_or_404(round_id)  # unknown round -> 404 with a clear message
+    try:
+        rnd = manager.fork_round(round_id)
+    except KeyError:
+        raise HTTPException(404, f"round {round_id!r} not found")
+    except RoundStateError as exc:
+        raise HTTPException(409, str(exc))
+    except SourceRoundGone as exc:
+        raise HTTPException(409, str(exc))
+    except BusyError as exc:
+        raise HTTPException(409, str(exc))
+    except ForkFailed as exc:
+        raise HTTPException(500, str(exc))
     return rnd.summary()
 
 
